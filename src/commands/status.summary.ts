@@ -1,27 +1,57 @@
-import { resolveContextTokensForModel } from "../agents/context.js";
 import { DEFAULT_CONTEXT_TOKENS, DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
-import { resolveConfiguredModelRef } from "../agents/model-selection.js";
-import type { OpenClawConfig } from "../config/config.js";
-import { loadConfig } from "../config/config.js";
-import {
-  loadSessionStore,
-  resolveFreshSessionTotalTokens,
-  resolveMainSessionKey,
-  resolveStorePath,
-  type SessionEntry,
-} from "../config/sessions.js";
-import {
-  classifySessionKey,
-  listAgentsForGateway,
-  resolveSessionModelRef,
-} from "../gateway/session-utils.js";
-import { buildChannelSummary } from "../infra/channel-summary.js";
-import { resolveHeartbeatSummaryForAgent } from "../infra/heartbeat-runner.js";
+import { areRuntimeModelRefsEquivalent } from "../agents/model-runtime-aliases.js";
+import { getRuntimeConfig } from "../config/config.js";
+import { resolveMainSessionKey } from "../config/sessions/main-session.js";
+import { hasSessionAutoModelFallbackProvenance } from "../config/sessions/model-override-provenance.js";
+import { resolveStorePath } from "../config/sessions/paths.js";
+import { readSessionStoreReadOnly } from "../config/sessions/store-read.js";
+import { resolveSessionTotalTokens, type SessionEntry } from "../config/sessions/types.js";
+import type { OpenClawConfig } from "../config/types.js";
+import { resolveCronStorePath } from "../cron/store.js";
+import { listGatewayAgentsBasic } from "../gateway/agent-list.js";
+import { resolveHeartbeatSummaryForAgent } from "../infra/heartbeat-summary.js";
 import { peekSystemEvents } from "../infra/system-events.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
+import { createLazyImportLoader } from "../shared/lazy-promise.js";
+import { createLazyRuntimeSurface } from "../shared/lazy-runtime.js";
+import {
+  summarizeActionableTaskAuditFindings,
+  summarizeRetainedLostTaskAuditFindings,
+} from "../tasks/task-registry.audit.js";
 import { resolveRuntimeServiceVersion } from "../version.js";
-import { resolveLinkChannelContext } from "./status.link-channel.js";
 import type { HeartbeatStatus, SessionStatus, StatusSummary } from "./status.types.js";
+
+const channelSummaryModuleLoader = createLazyImportLoader(
+  () => import("../infra/channel-summary.js"),
+);
+const channelPluginIdsModuleLoader = createLazyImportLoader(
+  () => import("../plugins/channel-plugin-ids.js"),
+);
+const linkChannelModuleLoader = createLazyImportLoader(() => import("./status.link-channel.js"));
+const taskRegistryMaintenanceModuleLoader = createLazyImportLoader(
+  () => import("../tasks/task-registry.maintenance.js"),
+);
+
+function loadChannelSummaryModule() {
+  return channelSummaryModuleLoader.load();
+}
+
+function loadChannelPluginIdsModule() {
+  return channelPluginIdsModuleLoader.load();
+}
+
+function loadLinkChannelModule() {
+  return linkChannelModuleLoader.load();
+}
+
+const loadStatusSummaryRuntimeModule = createLazyRuntimeSurface(
+  () => import("./status.summary.runtime.js"),
+  ({ statusSummaryRuntime }) => statusSummaryRuntime,
+);
+
+function loadTaskRegistryMaintenanceModule() {
+  return taskRegistryMaintenanceModuleLoader.load();
+}
 
 const buildFlags = (entry?: SessionEntry): string[] => {
   if (!entry) {
@@ -60,6 +90,32 @@ const buildFlags = (entry?: SessionEntry): string[] => {
   return flags;
 };
 
+function discountRetainedLostTaskFailures(
+  tasks: StatusSummary["tasks"],
+  retainedLostCount: number,
+): StatusSummary["tasks"] {
+  if (retainedLostCount <= 0 || tasks.failures <= 0) {
+    return tasks;
+  }
+  return {
+    ...tasks,
+    failures: Math.max(0, tasks.failures - retainedLostCount),
+  };
+}
+
+function hasUserPinnedModelSelection(entry: SessionEntry | undefined): boolean {
+  if (!entry?.modelOverride) {
+    return false;
+  }
+  if (entry.modelOverrideSource === "user") {
+    return true;
+  }
+  if (entry.modelOverrideSource === "auto") {
+    return false;
+  }
+  return !hasSessionAutoModelFallbackProvenance(entry);
+}
+
 export function redactSensitiveStatusSummary(summary: StatusSummary): StatusSummary {
   return {
     ...summary,
@@ -83,14 +139,35 @@ export function redactSensitiveStatusSummary(summary: StatusSummary): StatusSumm
 export async function getStatusSummary(
   options: {
     includeSensitive?: boolean;
+    includeChannelSummary?: boolean;
     config?: OpenClawConfig;
     sourceConfig?: OpenClawConfig;
   } = {},
 ): Promise<StatusSummary> {
-  const { includeSensitive = true } = options;
-  const cfg = options.config ?? loadConfig();
-  const linkContext = await resolveLinkChannelContext(cfg);
-  const agentList = listAgentsForGateway(cfg);
+  const { includeSensitive = true, includeChannelSummary = true } = options;
+  const {
+    classifySessionKey,
+    resolveConfiguredStatusModelRef,
+    resolveContextTokensForModel,
+    resolveSessionRuntimeLabel,
+    resolveSessionModelRef,
+  } = await loadStatusSummaryRuntimeModule();
+  const cfg = options.config ?? getRuntimeConfig();
+  const channelScopeConfig =
+    options.sourceConfig === undefined
+      ? { config: cfg }
+      : { config: cfg, activationSourceConfig: options.sourceConfig };
+  const needsChannelPlugins =
+    includeChannelSummary &&
+    (await loadChannelPluginIdsModule().then(({ hasConfiguredChannelsForReadOnlyScope }) =>
+      hasConfiguredChannelsForReadOnlyScope(channelScopeConfig),
+    ));
+  const linkContext = needsChannelPlugins
+    ? await loadLinkChannelModule().then(({ resolveLinkChannelContext }) =>
+        resolveLinkChannelContext(cfg, { sourceConfig: options.sourceConfig }),
+      )
+    : null;
+  const agentList = listGatewayAgentsBasic(cfg);
   const heartbeatAgents: HeartbeatStatus[] = agentList.agents.map((agent) => {
     const summary = resolveHeartbeatSummaryForAgent(cfg, agent.id);
     return {
@@ -100,15 +177,29 @@ export async function getStatusSummary(
       everyMs: summary.everyMs,
     } satisfies HeartbeatStatus;
   });
-  const channelSummary = await buildChannelSummary(cfg, {
-    colorize: true,
-    includeAllowFrom: true,
-    sourceConfig: options.sourceConfig,
-  });
+  const channelSummary = needsChannelPlugins
+    ? await loadChannelSummaryModule().then(({ buildChannelSummary }) =>
+        buildChannelSummary(cfg, {
+          colorize: true,
+          includeAllowFrom: true,
+          sourceConfig: options.sourceConfig,
+        }),
+      )
+    : [];
   const mainSessionKey = resolveMainSessionKey(cfg);
   const queuedSystemEvents = peekSystemEvents(mainSessionKey);
+  const taskMaintenanceModule = await loadTaskRegistryMaintenanceModule();
+  taskMaintenanceModule.configureTaskRegistryMaintenance({
+    cronStorePath: resolveCronStorePath(cfg.cron?.store),
+  });
+  const rawTasks = taskMaintenanceModule.getInspectableTaskRegistrySummary();
+  const taskAuditFindings = taskMaintenanceModule.getInspectableTaskAuditFindings();
+  const now = Date.now();
+  const taskAudit = summarizeActionableTaskAuditFindings(taskAuditFindings, { now });
+  const taskAuditRetainedLost = summarizeRetainedLostTaskAuditFindings(taskAuditFindings, { now });
+  const tasks = discountRetainedLostTaskFailures(rawTasks, taskAuditRetainedLost.count);
 
-  const resolved = resolveConfiguredModelRef({
+  const resolved = resolveConfiguredStatusModelRef({
     cfg,
     defaultProvider: DEFAULT_PROVIDER,
     defaultModel: DEFAULT_MODEL,
@@ -121,16 +212,18 @@ export async function getStatusSummary(
       model: configModel,
       contextTokensOverride: cfg.agents?.defaults?.contextTokens,
       fallbackContextTokens: DEFAULT_CONTEXT_TOKENS,
+      // Keep `status`/`status --json` startup read-only. These summary lookups
+      // should not kick off background provider discovery or plugin scans.
+      allowAsyncLoad: false,
     }) ?? DEFAULT_CONTEXT_TOKENS;
 
-  const now = Date.now();
   const storeCache = new Map<string, Record<string, SessionEntry | undefined>>();
   const loadStore = (storePath: string) => {
     const cached = storeCache.get(storePath);
     if (cached) {
       return cached;
     }
-    const store = loadSessionStore(storePath);
+    const store = readSessionStoreReadOnly(storePath);
     storeCache.set(storePath, store);
     return store;
   };
@@ -143,8 +236,25 @@ export async function getStatusSummary(
       .map(([key, entry]) => {
         const updatedAt = entry?.updatedAt ?? null;
         const age = updatedAt ? now - updatedAt : null;
+        const parsedAgentId = parseAgentSessionKey(key)?.agentId;
+        const agentId = opts.agentIdOverride ?? parsedAgentId;
+        const configuredForSession = resolveConfiguredStatusModelRef({
+          cfg,
+          defaultProvider: DEFAULT_PROVIDER,
+          defaultModel: DEFAULT_MODEL,
+          agentId,
+        });
+        const configuredSessionModel = configuredForSession.model ?? DEFAULT_MODEL;
+        const configuredSessionModelLabel = `${configuredForSession.provider ?? DEFAULT_PROVIDER}/${configuredSessionModel}`;
         const resolvedModel = resolveSessionModelRef(cfg, entry, opts.agentIdOverride);
-        const model = resolvedModel.model ?? configModel ?? null;
+        const model = resolvedModel.model ?? configuredSessionModel ?? null;
+        const selectedModelLabel =
+          resolvedModel.provider && model ? `${resolvedModel.provider}/${model}` : model;
+        const modelSelectionDiffers =
+          selectedModelLabel != null &&
+          selectedModelLabel !== configuredSessionModelLabel &&
+          !areRuntimeModelRefsEquivalent(selectedModelLabel, configuredSessionModelLabel) &&
+          hasUserPinnedModelSelection(entry);
         const contextTokens =
           resolveContextTokensForModel({
             cfg,
@@ -152,8 +262,9 @@ export async function getStatusSummary(
             model,
             contextTokensOverride: entry?.contextTokens,
             fallbackContextTokens: configContextTokens ?? undefined,
+            allowAsyncLoad: false,
           }) ?? null;
-        const total = resolveFreshSessionTotalTokens(entry);
+        const total = resolveSessionTotalTokens(entry);
         const totalTokensFresh =
           typeof entry?.totalTokens === "number" ? entry?.totalTokensFresh !== false : false;
         const remaining =
@@ -162,8 +273,14 @@ export async function getStatusSummary(
           contextTokens && contextTokens > 0 && total !== undefined
             ? Math.min(999, Math.round((total / contextTokens) * 100))
             : null;
-        const parsedAgentId = parseAgentSessionKey(key)?.agentId;
-        const agentId = opts.agentIdOverride ?? parsedAgentId;
+        const runtime = resolveSessionRuntimeLabel({
+          cfg,
+          entry,
+          provider: resolvedModel.provider,
+          model: model ?? "",
+          agentId,
+          sessionKey: key,
+        });
 
         return {
           agentId,
@@ -175,6 +292,7 @@ export async function getStatusSummary(
           thinkingLevel: entry?.thinkingLevel,
           fastMode: entry?.fastMode,
           verboseLevel: entry?.verboseLevel,
+          traceLevel: entry?.traceLevel,
           reasoningLevel: entry?.reasoningLevel,
           elevatedLevel: entry?.elevatedLevel,
           systemSent: entry?.systemSent,
@@ -188,6 +306,10 @@ export async function getStatusSummary(
           remainingTokens: remaining,
           percentUsed: pct,
           model,
+          configuredModel: configuredSessionModelLabel,
+          selectedModel: selectedModelLabel,
+          modelSelectionReason: modelSelectionDiffers ? "session override" : null,
+          runtime,
           contextTokens,
           flags: buildFlags(entry),
         } satisfies SessionStatus;
@@ -230,6 +352,9 @@ export async function getStatusSummary(
     },
     channelSummary,
     queuedSystemEvents,
+    tasks,
+    taskAudit,
+    ...(taskAuditRetainedLost.count > 0 ? { taskAuditRetainedLost } : {}),
     sessions: {
       paths: Array.from(paths),
       count: totalSessions,
